@@ -1,0 +1,18 @@
+[package]
+name = "rust_worker"
+version = "0.1.0"
+edition = "2021"
+description = "Fast image processing worker for auto-screencap"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+image = { version = "0.24", features = ["jpeg", "png"] }
+anyhow = "1.0"
+log = "0.4"
+simple_logger = "4.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
