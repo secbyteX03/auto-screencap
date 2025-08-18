@@ -18,6 +18,21 @@ import json
 import logging
 import argparse
 import threading
+
+# GUI dependencies
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+    import pyautogui
+    import pygetwindow as gw
+    from PIL import Image, ImageTk
+    HAS_GUI_DEPS = True
+except ImportError as e:
+    HAS_GUI_DEPS = False
+    print(f"Warning: GUI dependencies not available: {e}")
+    if '--nogui' not in sys.argv:
+        print("Run with --nogui to use command-line mode")
+        sys.exit(1)
 from datetime import datetime, time as dtime, timedelta
 from typing import Optional, Tuple, Dict, Any, Union, List
 import platform
@@ -551,7 +566,7 @@ class ScreenshotTool:
             # Skip if not within work hours (if work hours are enabled)
             if self.config["work_hours"]["enabled"] and not self._is_within_work_hours():
                 logger.debug("Skipping capture: outside of work hours")
-                return
+                return False, "Skipped: outside of work hours"
                 
             # Get the filename for this screenshot
             filename = self._get_screenshot_filename()
@@ -571,20 +586,20 @@ class ScreenshotTool:
                         ))
                     else:
                         logger.warning(f"Window not found: {self.target_window}")
-                        return
+                        return False, f"Window not found: {self.target_window}"
                 except Exception as e:
                     logger.error(f"Error capturing window: {e}")
-                    return
+                    return False, f"Error capturing window: {e}"
             elif self.mode == "region" and self.custom_region:
                 try:
                     x, y, width, height = self.custom_region
                     screenshot = pyautogui.screenshot(region=(x, y, width, height))
                 except Exception as e:
                     logger.error(f"Error capturing region: {e}")
-                    return
+                    return False, f"Error capturing region: {e}"
             else:
                 logger.error(f"Invalid capture mode or missing parameters: {self.mode}")
-                return
+                return False, f"Invalid capture mode or missing parameters: {self.mode}"
             
             # Apply face blur if enabled
             if self.config["enable_face_blur"] and HAS_OPENCV:
@@ -598,10 +613,12 @@ class ScreenshotTool:
                 
             screenshot.save(filename, format=self.image_format.upper(), **save_kwargs)
             logger.info(f"Screenshot saved: {filename}")
+            return True, filename
             
         except Exception as e:
-            logger.error(f"Error capturing screenshot: {e}", exc_info=True)
-            raise
+            error_msg = f"Error capturing screenshot: {e}"
+            logger.error(error_msg, exc_info=True)
+            return False, error_msg
     
     def _get_screenshot_filename(self) -> str:
         """Generate a filename for the screenshot"""
@@ -805,29 +822,24 @@ class ScreenshotTool:
                 return
                 
             self.running = True
-            
-            # Start the capture thread
-            self.screenshot_thread = threading.Thread(
-                target=self._capture_loop,
-                daemon=True
-            )
+            self.screenshot_thread = threading.Thread(target=self._capture_loop, daemon=True)
             self.screenshot_thread.start()
+            logger.info("Screenshot capture started")
             
-            # Update UI if in GUI mode
-            if not self.nogui and hasattr(self, 'start_button') and hasattr(self, 'stop_button') and hasattr(self, 'status_label'):
+            if hasattr(self, 'start_button'):
                 self.start_button.config(state=tk.DISABLED)
-                self.stop_button.config(state=tk.NORMAL)
-                self.status_label.config(text="Capturing...", fg="green")
+                if hasattr(self, 'stop_button'):
+                    self.stop_button.config(state=tk.NORMAL)
             
-            logger.info(f"Started capture with {self.interval}s interval")
-            self._show_notification(
-                "Capture Started",
-                f"Taking screenshots every {self.interval} seconds"
-            )
-            
-            # Start tray icon if enabled
-            if self.config["enable_tray"] and HAS_PYSTRAY and not self.nogui:
-                self._setup_tray_icon()
+            # Start tray icon if enabled (only if not already started)
+            if not hasattr(self, '_tray_icon_started') and self.config.get("enable_tray", True):
+                try:
+                    self._setup_tray_icon()
+                    self._tray_icon_started = True
+                except Exception as e:
+                    logger.warning(f"Failed to start tray icon: {e}")
+                    
+            self._show_notification("Capture Started", f"Taking screenshots every {self.interval} seconds")
             
         except Exception as e:
             error_msg = f"Error starting capture: {e}"
@@ -835,6 +847,56 @@ class ScreenshotTool:
             if not self.nogui:
                 messagebox.showerror("Error", error_msg)
             self.running = False
+    
+    def stop_capture(self):
+        """Stop the screenshot capture loop"""
+        if self.running:
+            self.running = False
+            if self.screenshot_thread and self.screenshot_thread.is_alive():
+                self.screenshot_thread.join(timeout=2.0)
+            logger.info("Screenshot capture stopped")
+            
+            if hasattr(self, 'start_button'):
+                self.start_button.config(state=tk.NORMAL)
+                if hasattr(self, 'stop_button'):
+                    self.stop_button.config(state=tk.DISABLED)
+            
+            self._show_notification("Capture Stopped", "Screenshot capture has been stopped")
+    
+    def test_screenshot(self):
+        """Take a single test screenshot to verify settings"""
+        try:
+            # Save the current running state
+            was_running = self.running
+            
+            # If currently running, pause the capture
+            if was_running:
+                self.stop_capture()
+            
+            # Take a single screenshot
+            success, filename = self.capture_screenshot()
+            
+            if success:
+                message = f"Test screenshot saved to:\n{filename}"
+                logger.info(message)
+                if not self.nogui:
+                    messagebox.showinfo("Test Screenshot", message)
+                self._show_notification("Test Screenshot", "Test screenshot captured successfully!")
+            else:
+                error_msg = f"Failed to capture test screenshot: {filename}"
+                logger.error(error_msg)
+                if not self.nogui:
+                    messagebox.showerror("Error", error_msg)
+            
+            # Restore the previous running state
+            if was_running:
+                self.start_capture()
+                
+        except Exception as e:
+            error_msg = f"Error taking test screenshot: {e}"
+            logger.error(error_msg, exc_info=True)
+            if not self.nogui:
+                messagebox.showerror("Error", error_msg)
 
 def main():
     """Main entry point for the application"""
