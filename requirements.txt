@@ -1,0 +1,13 @@
+# Core dependencies
+pyautogui>=0.9.53
+Pillow>=9.0.0
+pygetwindow>=0.0.9
+
+# Optional dependencies
+opencv-python>=4.5.5.64  # For face blurring
+pystray>=0.19.2          # For system tray icon
+plyer>=2.1.0             # For desktop notifications
+
+# Testing
+pytest>=7.0.0
+pytest-mock>=3.10.0
