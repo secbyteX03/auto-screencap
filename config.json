@@ -1,0 +1,19 @@
+{
+    "interval": 300,
+    "mode": "fullscreen",
+    "target_window": "",
+    "custom_region": null,
+    "save_path": "screenshots",
+    "image_format": "png",
+    "jpg_quality": 85,
+    "max_retention_days": 30,
+    "work_hours": {
+        "enabled": false,
+        "start": "09:00",
+        "end": "17:00"
+    },
+    "enable_tray": true,
+    "enable_notifications": true,
+    "enable_face_blur": false,
+    "log_level": "INFO"
+}
