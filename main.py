@@ -5,43 +5,271 @@ Captures screenshots at regular intervals with various options:
 - Full screen capture
 - Specific application window
 - Custom region selection
+- Configurable save paths and formats
+- Retention policy for old screenshots
+- Work hours scheduling
+- Optional face blurring for privacy
 """
 
 import os
+import sys
 import time
+import json
+import logging
+import argparse
 import threading
-from datetime import datetime
-from typing import Optional, Tuple
-import tkinter as tk
-from tkinter import messagebox, simpledialog
+from datetime import datetime, time as dtime, timedelta
+from typing import Optional, Tuple, Dict, Any, Union, List
+import platform
 
+def setup_logging(log_level: str = "INFO"):
+    """Set up logging configuration with rotation
+    
+    Args:
+        log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    """
+    import logging.handlers
+    import os
+    
+    # Create logs directory if it doesn't exist
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, 'auto_screencap.log')
+    
+    # Clear any existing handlers
+    logger = logging.getLogger()
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    # Set log level
+    log_level = getattr(logging, log_level.upper(), logging.INFO)
+    logger.setLevel(log_level)
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # File handler with rotation (10MB per file, keep 5 backups)
+    try:
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=10*1024*1024,  # 10MB
+            backupCount=5,
+            encoding='utf-8'
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        logger.info(f"Logging to {log_file}")
+    except Exception as e:
+        logger.error(f"Failed to set up file logging: {e}")
+        logger.warning("Logging to console only")
+    
+    return logger
+
+# Add TRACE level (level 5, between DEBUG and INFO)
+TRACE_LEVEL_NUM = 5
+def trace(self, message, *args, **kws):
+    if self.isEnabledFor(TRACE_LEVEL_NUM):
+        self._log(TRACE_LEVEL_NUM, message, args, **kws)
+logging.addLevelName(TRACE_LEVEL_NUM, "TRACE")
+logging.Logger.trace = trace
+
+# Initialize logger
+logger = logging.getLogger("auto-screencap")
+
+# Optional imports with graceful degradation
 try:
     import pyautogui
     import pygetwindow as gw
-    from PIL import Image, ImageTk
+    from PIL import Image, ImageTk, ImageFilter
+    HAS_GUI_DEPS = True
 except ImportError as e:
-    print(f"Required library not installed: {e}")
-    print("Please install required packages:")
-    print("pip install pyautogui pygetwindow pillow")
-    exit(1)
+    logger.warning(f"GUI dependencies not available: {e}")
+    HAS_GUI_DEPS = False
+
+try:
+    import cv2
+    HAS_OPENCV = True
+except ImportError:
+    HAS_OPENCV = False
+    logger.warning("OpenCV not installed. Face blurring will be disabled.")
+
+try:
+    import pystray
+    from pystray import MenuItem as item
+    from PIL import Image as PILImage
+    HAS_PYSTRAY = True
+except ImportError:
+    HAS_PYSTRAY = False
+    logger.warning("pystray not installed. System tray will be disabled.")
+
+try:
+    from plyer import notification
+    HAS_PLYER = True
+except ImportError:
+    HAS_PLYER = False
+    logger.warning("plyer not installed. Desktop notifications will be disabled.")
+
+# Default configuration
+DEFAULT_CONFIG = {
+    "interval": 300,  # 5 minutes
+    "mode": "fullscreen",  # fullscreen, window, region
+    "target_window": "",
+    "custom_region": None,  # [x, y, width, height]
+    "save_path": "screenshots",
+    "image_format": "png",  # png or jpg
+    "jpg_quality": 85,  # 1-100, only for jpg
+    "max_retention_days": 30,  # 0 to disable
+    "work_hours": {
+        "enabled": False,
+        "start": "09:00",
+        "end": "17:00"
+    },
+    "enable_tray": True,
+    "enable_notifications": True,
+    "enable_face_blur": False,
+    "log_level": "INFO"
+}
+
+def load_config(config_path: str = "config.json") -> Dict[str, Any]:
+    """Load configuration from file or create with defaults if not exists"""
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            # Ensure all default keys exist
+            for key, value in DEFAULT_CONFIG.items():
+                if key not in config:
+                    config[key] = value
+            return config
+    except Exception as e:
+        logger.error(f"Error loading config: {e}")
+    
+    # Create default config if file doesn't exist or error occurred
+    save_config(DEFAULT_CONFIG, config_path)
+    return DEFAULT_CONFIG.copy()
+
+def save_config(config: Dict[str, Any], config_path: str = "config.json"):
+    """Save configuration to file"""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(config_path)), exist_ok=True)
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=4)
+    except Exception as e:
+        logger.error(f"Error saving config: {e}")
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Automatic Screenshot Tool')
+    
+    # General options
+    parser.add_argument('--nogui', action='store_true', help='Run in command-line mode without GUI')
+    parser.add_argument('--config', default='config.json', help='Path to config file')
+    
+    # Screenshot options
+    parser.add_argument('--interval', type=int, help='Screenshot interval in seconds')
+    parser.add_argument('--mode', choices=['fullscreen', 'window', 'region'], help='Screenshot mode')
+    parser.add_argument('--window', help='Target window title (for window mode)')
+    parser.add_argument('--region', nargs=4, type=int, metavar=('X', 'Y', 'WIDTH', 'HEIGHT'), 
+                       help='Custom region coordinates (for region mode)')
+    parser.add_argument('--save-path', help='Directory to save screenshots')
+    parser.add_argument('--format', choices=['png', 'jpg'], help='Image format')
+    parser.add_argument('--quality', type=int, help='JPEG quality (1-100)')
+    
+    # Schedule options
+    parser.add_argument('--work-hours', nargs=2, metavar=('START', 'END'), 
+                       help='Work hours in 24h format (e.g., 09:00 17:00)')
+    parser.add_argument('--enable-work-hours', action='store_true', 
+                       help='Enable work hours filtering')
+    
+    # Feature toggles
+    parser.add_argument('--enable-tray', action='store_true', help='Enable system tray icon')
+    parser.add_argument('--disable-tray', action='store_true', help='Disable system tray icon')
+    parser.add_argument('--enable-notifications', action='store_true', help='Enable notifications')
+    parser.add_argument('--disable-notifications', action='store_true', 
+                       help='Disable notifications')
+    parser.add_argument('--enable-face-blur', action='store_true', help='Enable face blurring')
+    parser.add_argument('--disable-face-blur', action='store_true', 
+                       help='Disable face blurring')
+    
+    # Retention policy
+    parser.add_argument('--retention-days', type=int, 
+                       help='Maximum days to keep screenshots (0 to disable)')
+    
+    # Logging
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
+                       help='Set the logging level')
+    
+    return parser.parse_args()
 
 class ScreenshotTool:
-    def __init__(self):
+    def __init__(self, config_path: str = "config.json", nogui: bool = False):
+        """Initialize the screenshot tool with configuration
+        
+        Args:
+            config_path: Path to the configuration file
+            nogui: Whether to run in command-line mode without GUI
+        """
         self.running = False
         self.screenshot_thread = None
-        self.interval = 5  # Default 5 seconds
-        self.mode = "fullscreen"  # fullscreen, window, region
-        self.target_window = None
-        self.custom_region = None
-        self.screenshots_dir = "screenshots"
+        self.cleanup_thread = None
+        self.config_path = os.path.abspath(config_path)
+        self.config = load_config(config_path)
+        
+        # Apply command line args
+        self.nogui = nogui
+        
+        # Set up logging first
+        log_level = self.config.get("log_level", "INFO")
+        setup_logging(log_level)
+        
+        logger.info(f"Starting Auto Screenshot (GUI: {not nogui})")
+        logger.debug(f"Configuration loaded from {os.path.abspath(config_path)}")
+        
+        # Initialize attributes from config
+        self.interval = self.config["interval"]
+        self.mode = self.config["mode"]
+        self.target_window = self.config["target_window"]
+        self.custom_region = self.config["custom_region"]
+        self.screenshots_dir = os.path.expanduser(self.config["save_path"])
+        self.image_format = self.config["image_format"].lower()
+        self.jpg_quality = max(1, min(100, self.config["jpg_quality"]))  # Clamp 1-100
         
         # Create screenshots directory
-        os.makedirs(self.screenshots_dir, exist_ok=True)
+        try:
+            os.makedirs(self.screenshots_dir, exist_ok=True)
+            logger.debug(f"Screenshots will be saved to: {self.screenshots_dir}")
+        except Exception as e:
+            logger.error(f"Failed to create screenshots directory: {e}")
+            raise
         
         # Disable pyautogui failsafe for smoother operation
-        pyautogui.FAILSAFE = False
+        if HAS_GUI_DEPS:
+            pyautogui.FAILSAFE = False
         
-        self.setup_gui()
+        # Initialize tray icon
+        self.tray_icon = None
+        
+        # Setup GUI unless running in nogui mode
+        if not self.nogui and HAS_GUI_DEPS:
+            self.setup_gui()
+        elif self.nogui:
+            logger.info("Running in command-line mode")
+            self.start_capture()
+        else:
+            logger.error("GUI dependencies not available. Run with --nogui")
+            sys.exit(1)
+        
+        # Start cleanup thread if retention is enabled
+        if self.config["max_retention_days"] > 0:
+            self._start_cleanup_thread()
     
     def setup_gui(self):
         """Create the main GUI interface"""
@@ -187,341 +415,450 @@ class ScreenshotTool:
     
     def create_region_selector(self):
         """Create an overlay for region selection"""
-        # Get screen dimensions
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
+        # Store references to avoid garbage collection
+        self.overlay = tk.Toplevel(self.root)
+        self.overlay.attributes('-fullscreen', True)
+        self.overlay.attributes('-alpha', 0.3)
+        self.overlay.configure(bg='black')
+        self.overlay.attributes('-topmost', True)
         
-        # Create fullscreen transparent window
-        overlay = tk.Toplevel()
-        overlay.attributes('-fullscreen', True)
-        overlay.attributes('-alpha', 0.3)
-        overlay.configure(bg='black')
-        overlay.attributes('-topmost', True)
-        
-        canvas = tk.Canvas(overlay, highlightthickness=0)
-        canvas.pack(fill=tk.BOTH, expand=True)
+        # Create canvas for drawing selection
+        self.selection_canvas = tk.Canvas(
+            self.overlay, 
+            highlightthickness=0,
+            cursor='crosshair'
+        )
+        self.selection_canvas.pack(fill=tk.BOTH, expand=True)
         
         # Variables for selection
-        start_x = start_y = end_x = end_y = 0
-        selection_rect = None
+        self.selection_start = None
+        self.selection_rect = None
         
-        def on_mouse_down(event):
-            nonlocal start_x, start_y, selection_rect
-            start_x, start_y = event.x, event.y
-            if selection_rect:
-                canvas.delete(selection_rect)
+        # Bind events
+        self.selection_canvas.bind('<ButtonPress-1>', self._on_region_select_start)
+        self.selection_canvas.bind('<B1-Motion>', self._on_region_select_drag)
+        self.selection_canvas.bind('<ButtonRelease-1>', self._on_region_select_end)
+        self.overlay.bind('<Escape>', lambda e: self._cancel_region_selection())
         
-        def on_mouse_drag(event):
-            nonlocal selection_rect, end_x, end_y
-            end_x, end_y = event.x, event.y
-            if selection_rect:
-                canvas.delete(selection_rect)
-            selection_rect = canvas.create_rectangle(
-                start_x, start_y, end_x, end_y, 
-                outline='red', width=2
-            )
+        # Make sure overlay gets focus
+        self.overlay.focus_force()
         
-        def on_mouse_up(event):
-            nonlocal end_x, end_y
-            end_x, end_y = event.x, event.y
+    def _on_region_select_start(self, event):
+        """Handle mouse button press for region selection"""
+        self.selection_start = (event.x, event.y)
+        if self.selection_rect:
+            self.selection_canvas.delete(self.selection_rect)
             
-            # Calculate region coordinates
-            x1, y1 = min(start_x, end_x), min(start_y, end_y)
-            x2, y2 = max(start_x, end_x), max(start_y, end_y)
+    def _on_region_select_drag(self, event):
+        """Handle mouse drag for region selection"""
+        if not self.selection_start:
+            return
             
-            if abs(x2 - x1) > 10 and abs(y2 - y1) > 10:  # Minimum size check
-                self.custom_region = (x1, y1, x2 - x1, y2 - y1)  # (x, y, width, height)
-                self.region_label.config(
-                    text=f"Region: {x1},{y1} - {x2}x{y2} ({x2-x1}x{y2-y1})"
-                )
+        x0, y0 = self.selection_start
+        x1, y1 = event.x, event.y
+        
+        # Delete previous rectangle if it exists
+        if self.selection_rect:
+            self.selection_canvas.delete(self.selection_rect)
             
-            overlay.destroy()
-            self.root.deiconify()  # Show main window again
+        # Draw new rectangle
+        self.selection_rect = self.selection_canvas.create_rectangle(
+            x0, y0, x1, y1,
+            outline='red',
+            width=2,
+            dash=(4, 4)
+        )
         
-        # Bind mouse events
-        canvas.bind('<Button-1>', on_mouse_down)
-        canvas.bind('<B1-Motion>', on_mouse_drag)
-        canvas.bind('<ButtonRelease-1>', on_mouse_up)
+    def _on_region_select_end(self, event):
+        """Handle mouse button release for region selection"""
+        if not self.selection_start:
+            return
+            
+        x0, y0 = self.selection_start
+        x1, y1 = event.x, event.y
         
-        # Add instruction text
-        canvas.create_text(screen_width//2, 50, 
-                          text="Click and drag to select region. Release to confirm.", 
-                          fill='white', font=('Arial', 16))
-        canvas.create_text(screen_width//2, 80, 
-                          text="Press ESC to cancel", 
-                          fill='white', font=('Arial', 12))
+        # Ensure coordinates are in the correct order
+        x0, x1 = sorted([x0, x1])
+        y0, y1 = sorted([y0, y1])
         
-        # ESC to cancel
-        def on_escape(event):
-            overlay.destroy()
+        # Store the selected region
+        self.custom_region = (x0, y0, x1 - x0, y1 - y0)
+        logger.info(f"Selected region: {self.custom_region}")
+        
+        # Clean up
+        self._cancel_region_selection()
+        
+        # Show main window again
+        if hasattr(self, 'root') and self.root:
             self.root.deiconify()
-        
-        overlay.bind('<Escape>', on_escape)
-        overlay.focus_set()
+            
+    def _cancel_region_selection(self):
+        """Cancel region selection and clean up"""
+        if hasattr(self, 'overlay') and self.overlay:
+            self.overlay.destroy()
+            self.overlay = None
+        self.selection_start = None
+        self.selection_rect = None
     
-    def take_screenshot(self) -> Optional[str]:
-        """Take a screenshot based on current mode and save it"""
+    def _cleanup_old_screenshots(self):
+        """Delete screenshots older than max_retention_days"""
+        if self.config["max_retention_days"] <= 0:
+            return
+                
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"screenshot_{timestamp}.png"
-            filepath = os.path.join(self.screenshots_dir, filename)
-            
-            mode = self.mode_var.get()
-            
-            if mode == "fullscreen":
-                screenshot = pyautogui.screenshot()
-            
-            elif mode == "window" and self.target_window:
-                # Find the window
-                windows = [w for w in gw.getAllWindows() if w.title == self.target_window]
-                if not windows:
-                    self.status_label.config(text="Target window not found!", fg="red")
-                    return None
+            now = datetime.now()
+            cutoff_date = now - timedelta(days=self.config["max_retention_days"])
                 
-                window = windows[0]
-                # Bring window to front
-                try:
-                    window.activate()
-                    time.sleep(0.1)  # Small delay to ensure window is active
-                except:
-                    pass  # Some windows can't be activated
-                
-                # Capture window region
-                screenshot = pyautogui.screenshot(region=(
-                    window.left, window.top, window.width, window.height
-                ))
-            
-            elif mode == "region" and self.custom_region:
-                x, y, width, height = self.custom_region
-                screenshot = pyautogui.screenshot(region=(x, y, width, height))
-            
-            else:
-                self.status_label.config(text="Invalid configuration!", fg="red")
-                return None
-            
-            # Save screenshot
-            screenshot.save(filepath)
-            self.screenshot_count += 1
-            self.counter_label.config(text=f"Screenshots taken: {self.screenshot_count}")
-            
-            return filepath
-        
+            for filename in os.listdir(self.screenshots_dir):
+                if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    continue
+                        
+                filepath = os.path.join(self.screenshots_dir, filename)
+                mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+                    
+                if mtime < cutoff_date:
+                    try:
+                        os.remove(filepath)
+                        logger.debug(f"Deleted old screenshot: {filename}")
+                    except Exception as e:
+                        logger.error(f"Error deleting {filename}: {e}")
+                        
         except Exception as e:
-            self.status_label.config(text=f"Error: {str(e)}", fg="red")
-            return None
-    
-    def screenshot_loop(self):
-        """Main screenshot capture loop"""
-        while self.running:
-            filepath = self.take_screenshot()
-            if filepath:
-                self.status_label.config(
-                    text=f"Captured: {os.path.basename(filepath)}", 
-                    fg="green"
-                )
-            
-            # Wait for the specified interval
-            for _ in range(int(self.interval * 10)):  # Check every 0.1 seconds
-                if not self.running:
-                    break
-                time.sleep(0.1)
-    
-    def start_capture(self):
-        """Start the automatic screenshot capture"""
+            logger.error(f"Error during cleanup: {e}")
+            raise  # Re-raise the exception to be caught by the cleanup loop
+
+    def _start_cleanup_thread(self):
+        """Start a background thread for cleanup tasks"""
+        def cleanup_loop():
+            while self.running:
+                try:
+                    self._cleanup_old_screenshots()
+                    # Run cleanup once per hour
+                    for _ in range(3600):  # Check every second for 1 hour
+                        if not self.running:
+                            break
+                        time.sleep(1)
+                except Exception as e:
+                    logger.error(f"Error in cleanup thread: {e}")
+                    time.sleep(60)  # Wait a minute before retrying
+        
+        self.cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
+        self.cleanup_thread.start()
+
+    def capture_screenshot(self):
+        """Capture a single screenshot based on current settings"""
         try:
-            self.interval = float(self.interval_var.get())
-            if self.interval < 0.5:
-                messagebox.showwarning("Invalid Interval", 
-                                     "Interval must be at least 0.5 seconds")
+            # Skip if not within work hours (if work hours are enabled)
+            if self.config["work_hours"]["enabled"] and not self._is_within_work_hours():
+                logger.debug("Skipping capture: outside of work hours")
                 return
-        except ValueError:
-            messagebox.showerror("Invalid Interval", 
-                               "Please enter a valid number for interval")
-            return
-        
-        mode = self.mode_var.get()
-        
-        # Validate configuration
-        if mode == "window" and not self.target_window:
-            messagebox.showwarning("No Window Selected", 
-                                 "Please select a target window first")
-            return
-        
-        if mode == "region" and not self.custom_region:
-            messagebox.showwarning("No Region Selected", 
-                                 "Please select a custom region first")
-            return
-        
-        self.mode = mode
-        self.running = True
-        
-        # Start screenshot thread
-        self.screenshot_thread = threading.Thread(target=self.screenshot_loop)
-        self.screenshot_thread.daemon = True
-        self.screenshot_thread.start()
-        
-        # Update UI
-        self.start_button.config(state=tk.DISABLED)
-        self.stop_button.config(state=tk.NORMAL)
-        self.status_label.config(text="Capturing screenshots...", fg="blue")
+                
+            # Get the filename for this screenshot
+            filename = self._get_screenshot_filename()
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            
+            # Take the screenshot based on the current mode
+            if self.mode == "fullscreen":
+                screenshot = pyautogui.screenshot()
+            elif self.mode == "window" and self.target_window:
+                try:
+                    # Try to get the window by title
+                    window = gw.getWindowsWithTitle(self.target_window)[0]
+                    if window:
+                        screenshot = pyautogui.screenshot(region=(
+                            window.left, window.top, 
+                            window.width, window.height
+                        ))
+                    else:
+                        logger.warning(f"Window not found: {self.target_window}")
+                        return
+                except Exception as e:
+                    logger.error(f"Error capturing window: {e}")
+                    return
+            elif self.mode == "region" and self.custom_region:
+                try:
+                    x, y, width, height = self.custom_region
+                    screenshot = pyautogui.screenshot(region=(x, y, width, height))
+                except Exception as e:
+                    logger.error(f"Error capturing region: {e}")
+                    return
+            else:
+                logger.error(f"Invalid capture mode or missing parameters: {self.mode}")
+                return
+            
+            # Apply face blur if enabled
+            if self.config["enable_face_blur"] and HAS_OPENCV:
+                screenshot = self._blur_faces(screenshot)
+            
+            # Save the screenshot in the requested format
+            save_kwargs = {}
+            if self.image_format == "jpg":
+                save_kwargs["quality"] = self.jpg_quality
+                save_kwargs["optimize"] = True
+                
+            screenshot.save(filename, format=self.image_format.upper(), **save_kwargs)
+            logger.info(f"Screenshot saved: {filename}")
+            
+        except Exception as e:
+            logger.error(f"Error capturing screenshot: {e}", exc_info=True)
+            raise
     
-    def stop_capture(self):
-        """Stop the automatic screenshot capture"""
+    def _get_screenshot_filename(self) -> str:
+        """Generate a filename for the screenshot"""
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"screenshot_{timestamp}.{self.image_format}"
+        return os.path.join(self.screenshots_dir, filename)
+    
+    def _is_within_work_hours(self) -> bool:
+        """Check if current time is within configured work hours"""
+        if not self.config["work_hours"]["enabled"]:
+            return True
+            
+        try:
+            now = datetime.now().time()
+            start = datetime.strptime(self.config["work_hours"]["start"], "%H:%M").time()
+            end = datetime.strptime(self.config["work_hours"]["end"], "%H:%M").time()
+            
+            # Handle overnight work hours
+            if start < end:
+                return start <= now <= end
+            else:
+                return now >= start or now <= end
+        except Exception as e:
+            logger.error(f"Error checking work hours: {e}")
+            return True  # Default to allowing captures if there's an error
+    
+    def _blur_faces(self, image):
+        """Apply face blurring to the image if OpenCV is available"""
+        if not HAS_OPENCV:
+            logger.warning("OpenCV not available, skipping face blur")
+            return image
+            
+        try:
+            import cv2
+            import numpy as np
+            from PIL import Image
+            
+            # Convert PIL Image to OpenCV format
+            img_array = np.array(image)
+            img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            
+            # Load the pre-trained face detector
+            face_cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            )
+            
+            # Detect faces in the image
+            gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+            
+            # Blur each detected face
+            for (x, y, w, h) in faces:
+                # Extract the region of interest (face)
+                face_roi = img_array[y:y+h, x:x+w]
+                
+                # Apply Gaussian blur to the face region
+                face_roi = cv2.GaussianBlur(face_roi, (99, 99), 30)
+                
+                # Put the blurred face back into the image
+                img_array[y:y+h, x:x+w] = face_roi
+            
+            # Convert back to PIL Image
+            img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(img_array)
+            
+        except Exception as e:
+            logger.error(f"Error applying face blur: {e}")
+            return image  # Return original image if there's an error
+    
+    def _capture_loop(self):
+        """Main capture loop"""
+        while self.running:
+            try:
+                self.capture_screenshot()
+                
+                # Sleep for the interval, but check for stop every second
+                for _ in range(self.interval):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"Error in capture loop: {e}")
+                time.sleep(5)  # Prevent tight loop on error
+                
+    def _show_notification(self, title: str, message: str):
+        """Show a desktop notification if enabled and available"""
+        if not self.config["enable_notifications"] or not HAS_PLYER:
+            return
+            
+        try:
+            notification.notify(
+                title=title,
+                message=message,
+                app_name="Auto Screenshot",
+                timeout=5
+            )
+        except Exception as e:
+            logger.warning(f"Could not show notification: {e}")
+        
+    def _setup_tray_icon(self):
+        """Set up the system tray icon"""
+        if not HAS_PYSTRAY or self.nogui or not self.config["enable_tray"]:
+            return
+            
+        try:
+            from PIL import Image, ImageDraw
+            
+            # Create a simple icon
+            width = 64
+            height = 64
+            color = "#3498db"
+            
+            # Create a new image with a transparent background
+            image = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+            dc = ImageDraw.Draw(image)
+            
+            # Draw a simple camera icon
+            dc.ellipse((10, 10, width-10, height-10), fill=color)
+            dc.ellipse((20, 20, width-20, height-20), fill="white")
+            
+            # Create menu items
+            menu_items = []
+            
+            if self.running:
+                menu_items.append(
+                    pystray.MenuItem(
+                        'Stop Capture',
+                        lambda: self.stop_capture()
+                    )
+                )
+            else:
+                menu_items.append(
+                    pystray.MenuItem(
+                        'Start Capture',
+                        lambda: self.start_capture()
+                    )
+                )
+                
+            menu_items.extend([
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem('Exit', lambda: self.on_close())
+            ])
+            
+            # Create the tray icon
+            self.tray_icon = pystray.Icon(
+                "auto_screencap",
+                image,
+                "Auto Screenshot",
+                menu=pystray.Menu(*menu_items)
+            )
+            
+            # Start the tray icon in a separate thread
+            threading.Thread(
+                target=self.tray_icon.run,
+                daemon=True
+            ).start()
+            
+            logger.debug("Tray icon started")
+            
+        except Exception as e:
+            logger.error(f"Error setting up tray icon: {e}")
+            self.tray_icon = None
+        
+    def on_close(self):
+        """Handle application close"""
+        if hasattr(self, 'tray_icon') and self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception as e:
+                logger.debug(f"Error stopping tray icon: {e}")
+                
+        if hasattr(self, 'root'):
+            try:
+                self.root.quit()
+                self.root.destroy()
+            except Exception as e:
+                logger.debug(f"Error closing root window: {e}")
+                
         self.running = False
         
-        if self.screenshot_thread:
-            self.screenshot_thread.join(timeout=1)
-        
-        # Update UI
-        self.start_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
-        self.status_label.config(text="Stopped", fg="orange")
-    
-    def test_screenshot(self):
-        """Take a single test screenshot"""
-        mode = self.mode_var.get()
-        
-        if mode == "window" and not self.target_window:
-            messagebox.showwarning("No Window Selected", 
-                                 "Please select a target window first")
-            return
-        
-        if mode == "region" and not self.custom_region:
-            messagebox.showwarning("No Region Selected", 
-                                 "Please select a custom region first")
-            return
-        
-        self.mode = mode
-        filepath = self.take_screenshot()
-        
-        if filepath:
-            messagebox.showinfo("Test Screenshot", 
-                              f"Test screenshot saved as:\n{filepath}")
-    
-    def run(self):
-        """Start the application"""
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        self.root.mainloop()
-    
-    def on_closing(self):
-        """Handle window closing"""
+    def start_capture(self):
+        """Start the screenshot capture loop"""
         if self.running:
-            self.stop_capture()
-        self.root.destroy()
-
-class CommandLineInterface:
-    """Command line interface for the screenshot tool"""
-    
-    @staticmethod
-    def show_windows():
-        """Display all available windows"""
-        windows = gw.getAllWindows()
-        print("\nAvailable windows:")
-        for i, window in enumerate(windows):
-            if window.title.strip():
-                print(f"{i+1}. {window.title}")
-    
-    @staticmethod
-    def run_cli():
-        """Run command line version"""
-        print("=== Automatic Screenshot Tool (CLI) ===")
-        print("1. Full screen")
-        print("2. Specific window")
-        print("3. Custom region")
-        
+            return
+            
         try:
-            choice = input("\nSelect mode (1-3): ").strip()
-            interval = float(input("Enter interval in seconds: "))
+            # Update settings from UI if available
+            if hasattr(self, 'interval_var'):
+                self.interval = int(self.interval_var.get())
+                self.config["interval"] = self.interval
+            if hasattr(self, 'mode_var'):
+                self.mode = self.mode_var.get()
+                self.config["mode"] = self.mode
             
-            if interval < 0.5:
-                print("Interval must be at least 0.5 seconds")
+            if self.interval < 1:
+                error_msg = "Interval must be at least 1 second"
+                if not self.nogui:
+                    messagebox.showerror("Error", error_msg)
+                logger.error(error_msg)
                 return
-            
-            screenshots_dir = "screenshots"
-            os.makedirs(screenshots_dir, exist_ok=True)
-            
-            if choice == "1":
-                mode = "fullscreen"
-                print(f"Starting fullscreen capture every {interval} seconds...")
-                print("Press Ctrl+C to stop")
                 
-            elif choice == "2":
-                CommandLineInterface.show_windows()
-                window_num = int(input("\nEnter window number: ")) - 1
-                windows = [w for w in gw.getAllWindows() if w.title.strip()]
-                
-                if 0 <= window_num < len(windows):
-                    target_window = windows[window_num]
-                    print(f"Capturing window: {target_window.title}")
-                    print("Press Ctrl+C to stop")
-                else:
-                    print("Invalid window number")
-                    return
-                    
-            elif choice == "3":
-                print("Region selection not available in CLI mode.")
-                print("Please use GUI mode for region selection.")
-                return
+            self.running = True
             
-            else:
-                print("Invalid choice")
-                return
+            # Start the capture thread
+            self.screenshot_thread = threading.Thread(
+                target=self._capture_loop,
+                daemon=True
+            )
+            self.screenshot_thread.start()
             
-            # Start capture loop
-            count = 0
-            try:
-                while True:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"screenshot_{timestamp}.png"
-                    filepath = os.path.join(screenshots_dir, filename)
-                    
-                    if choice == "1":
-                        screenshot = pyautogui.screenshot()
-                    elif choice == "2":
-                        try:
-                            target_window.activate()
-                            time.sleep(0.1)
-                        except:
-                            pass
-                        screenshot = pyautogui.screenshot(region=(
-                            target_window.left, target_window.top, 
-                            target_window.width, target_window.height
-                        ))
-                    
-                    screenshot.save(filepath)
-                    count += 1
-                    print(f"Screenshot {count} saved: {filename}")
-                    
-                    time.sleep(interval)
-                    
-            except KeyboardInterrupt:
-                print(f"\nStopped. Total screenshots taken: {count}")
-        
-        except (ValueError, IndexError) as e:
-            print(f"Error: {e}")
+            # Update UI if in GUI mode
+            if not self.nogui and hasattr(self, 'start_button') and hasattr(self, 'stop_button') and hasattr(self, 'status_label'):
+                self.start_button.config(state=tk.DISABLED)
+                self.stop_button.config(state=tk.NORMAL)
+                self.status_label.config(text="Capturing...", fg="green")
+            
+            logger.info(f"Started capture with {self.interval}s interval")
+            self._show_notification(
+                "Capture Started",
+                f"Taking screenshots every {self.interval} seconds"
+            )
+            
+            # Start tray icon if enabled
+            if self.config["enable_tray"] and HAS_PYSTRAY and not self.nogui:
+                self._setup_tray_icon()
+            
         except Exception as e:
-            print(f"Unexpected error: {e}")
+            error_msg = f"Error starting capture: {e}"
+            logger.error(error_msg, exc_info=True)
+            if not self.nogui:
+                messagebox.showerror("Error", error_msg)
+            self.running = False
 
 def main():
-    """Main function to choose between GUI and CLI"""
-    print("Automatic Screenshot Tool")
-    print("1. Launch GUI (recommended)")
-    print("2. Use command line interface")
-    
+    """Main entry point for the application"""
     try:
-        choice = input("Select interface (1-2, or press Enter for GUI): ").strip()
+        # Parse command line arguments
+        args = parse_args()
         
-        if choice == "2":
-            CommandLineInterface.run_cli()
-        else:
-            # Default to GUI
-            app = ScreenshotTool()
-            app.run()
-    
-    except KeyboardInterrupt:
-        print("\nExiting...")
+        # Initialize and run the application
+        app = ScreenshotTool(
+            config_path=args.config,
+            nogui=args.nogui
+        )
+        
+        # Start the main loop if in GUI mode
+        if not args.nogui and HAS_GUI_DEPS:
+            app.root.mainloop()
+        
     except Exception as e:
-        print(f"Error starting application: {e}")
+        logger.error(f"Application error: {e}", exc_info=True)
+        if not args.nogui and HAS_GUI_DEPS:
+            messagebox.showerror("Error", f"An error occurred: {e}")
+        return 1
+    
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
